@@ -218,14 +218,56 @@ class SerialReader:
 
 def main():
     ap = argparse.ArgumentParser(description="Read and interpret NMEA from a Navisys GR-M02 or similar GNSS")
-    ap.add_argument("--port", default="/dev/ttyUSB0")
-    ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--json", action="store_true", help="emit compact JSON status lines once per second")
-    ap.add_argument("--raw", action="store_true", help="echo valid NMEA sentences")
-    ap.add_argument("--log", default=None, help="path to append raw NMEA")
-    ap.add_argument("--once", action="store_true", help="exit after first valid fix summary")
-    ap.add_argument("--format", default=None, help="custom format string using %% formatting (%%(utc_time)s|lat: %%(lat).6f')")
+    ap.add_argument("-p", "--port", default="/dev/ttyUSB0")
+    ap.add_argument("-b", "--baud", type=int, default=115200)
+    ap.add_argument("-j", "--json", action="store_true", help="emit compact JSON status lines once per second")
+    ap.add_argument("-r", "--raw", action="store_true", help="echo valid NMEA sentences")
+    ap.add_argument("-l", "--log", default=None, help="path to append raw NMEA")
+    ap.add_argument("-o", "--once", action="store_true", help="exit after first valid fix summary")
+    ap.add_argument("-f", "--format", default=None, help="custom format string using %% formatting (%%(utc_time)s|lat: %%(lat).6f')")
+    ap.add_argument("-P", "--partial", action="store_true", help="allow partial outputs without lat/lon/utc_time")
+    ap.add_argument("--help-format", action="store_true", help="show available format keys and exit")
     args = ap.parse_args()
+
+    if args.help_format:
+        print("Available format keys for use with --format:")
+        print("\nTime and Position:")
+        print("  %(utc_time)s      - ISO-8601 UTC timestamp (e.g., '2025-10-29T12:34:56Z')")
+        print("  %(lat).6f         - Latitude in decimal degrees")
+        print("  %(lon).6f         - Longitude in decimal degrees")
+        print("  %(alt_m).1f       - Altitude in meters above MSL")
+        print("\nFix Quality and Status:")
+        print("  %(fix_ok)s        - Boolean indicating valid position fix")
+        print("  %(fix_quality)d   - GGA fix quality (0=no fix, 1=GPS, 2=DGPS, 4=RTK-fix, 5=RTK-float)")
+        print("  %(fix_type)d      - GSA fix dimension (1=no fix, 2=2D, 3=3D)")
+        print("  %(mode)s          - NMEA positioning mode (N/A/D/E/R/F)")
+        print("\nSatellite Information:")
+        print("  %(num_sats)d      - Number of satellites used in solution")
+        print("  %(gsv)s           - Satellites in view per constellation (dict)")
+        print("\nDilution of Precision:")
+        print("  %(hdop).2f        - Horizontal dilution of precision")
+        print("  %(vdop).2f        - Vertical dilution of precision")
+        print("  %(pdop).2f        - Position dilution of precision")
+        print("\nMotion:")
+        print("  %(speed_mps).2f   - Ground speed in meters per second")
+        print("  %(speed_kmh).2f   - Ground speed in kilometers per hour")
+        print("  %(course_deg).1f  - Course over ground in degrees (0-360)")
+        print("\nDifferential Corrections:")
+        print("  %(geoid_sep_m).1f - Geoid separation in meters")
+        print("  %(age_corrections_s)s - Age of differential corrections in seconds")
+        print("  %(dgps_id)s       - Differential reference station ID")
+        print("\nError Estimates:")
+        print("  %(rms_range_err_m).2f - RMS of pseudorange residuals in meters")
+        print("  %(sd_lat_m).2f    - Standard deviation of latitude error in meters")
+        print("  %(sd_lon_m).2f    - Standard deviation of longitude error in meters")
+        print("  %(sd_alt_m).2f    - Standard deviation of altitude error in meters")
+        print("\nMetadata:")
+        print("  %(last_update).3f - Local timestamp when record was emitted")
+        print("\nExample format strings:")
+        print("  --format 'Lat: %(lat).6f, Lon: %(lon).6f'")
+        print("  --format '%(utc_time)s | %(lat).6f,%(lon).6f | Alt: %(alt_m).1fm | Sats: %(num_sats)d'")
+        print("  --format 'Speed: %(speed_kmh).1f km/h | Course: %(course_deg).0f°'")
+        sys.exit(0)
 
     rdr = SerialReader(args.port, args.baud)
     try:
@@ -239,6 +281,83 @@ def main():
     logf = None
     if args.log:
         logf = open(args.log, "a", buffering=1)
+
+    # Special handling for --once: collect two outputs and print the longer one (avoids partial data)
+    if args.once:
+        outputs = []
+        for raw in rdr.readlines():
+            try:
+                s = raw.decode('ascii', errors='ignore').strip()
+            except:
+                continue
+            if not s.startswith('$'):
+                continue
+            m = NMEA_RE.match(s)
+            if not m:
+                continue
+            body = m.group(1) + ',' + m.group(2)
+            cs = m.group(3).upper()
+            calc = nmea_checksum(body)
+            if cs != calc:
+                continue  # bad checksum
+            talker_sen = m.group(1)  # e.g., GNRMC
+            fields = m.group(2).split(',')
+
+            if args.raw:
+                print(s)
+            if logf:
+                logf.write(s + "\n")
+
+            updates = parse_sentence(talker_sen, fields)
+            if updates:
+                merge_updates(state, updates)
+
+            now = time.time()
+            if now - last_emit >= 1.0:
+                last_emit = now
+                if state.get('lat') is not None and state.get('lon') is not None and state.get('utc_time'):
+                    # Generate output
+                    if args.format:
+                        try:
+                            format_dict = {}
+                            for k, v in state.items():
+                                if k == 'gsv':
+                                    format_dict[k] = str(v)
+                                elif isinstance(v, float):
+                                    format_dict[k] = v
+                                else:
+                                    format_dict[k] = v
+                            output = args.format % format_dict
+                            outputs.append(output)
+                        except (KeyError, ValueError, TypeError) as e:
+                            print(f"Format error: {e}", file=sys.stderr)
+                    elif args.json:
+                        out = dict(state)  # shallow copy
+                        # reduce float verbosity and format gsv for readability
+                        for k in list(out.keys()):
+                            v = out[k]
+                            if k == 'gsv':
+                                # Flatten gsv to just {"GP": 7, "GL": 8} format
+                                out[k] = {sys: data.get('in_view', 0) for sys, data in v.items()}
+                            elif isinstance(v, float):
+                                out[k] = round(v, 6 if k in ('lat','lon') else 3)
+                        output = json.dumps(out, separators=(',',':'), ensure_ascii=False)
+                        outputs.append(output)
+                    else:
+                        output = human_status(state)
+                        outputs.append(output)
+
+                    # Exit after collecting two outputs
+                    if len(outputs) >= 2:
+                        break
+
+        # Print the longer of the two outputs
+        if outputs:
+            longer = max(outputs, key=len)
+            print(longer, flush=True)
+        if logf:
+            logf.close()
+        return
 
     try:
         for raw in rdr.readlines():
@@ -271,37 +390,38 @@ def main():
             now = time.time()
             if now - last_emit >= 1.0:
                 last_emit = now
-                if args.format:
-                    # Custom format string output
-                    try:
-                        # Create a dict with safe defaults for missing values
-                        format_dict = {}
-                        for k, v in state.items():
+                if args.partial or (state.get('lat') is not None and state.get('lon') is not None and state.get('utc_time')):
+                    if args.format:
+                        # Custom format string output
+                        try:
+                            # Create a dict with safe defaults for missing values
+                            format_dict = {}
+                            for k, v in state.items():
+                                if k == 'gsv':
+                                    # Convert GSV dict to string representation
+                                    format_dict[k] = str(v)
+                                elif isinstance(v, float):
+                                    format_dict[k] = v
+                                else:
+                                    format_dict[k] = v
+                            # Use % formatting with the state dict
+                            print(args.format % format_dict, flush=True)
+                        except (KeyError, ValueError, TypeError) as e:
+                            print(f"Format error: {e}", file=sys.stderr)
+                    elif args.json:
+                        out = dict(state)  # shallow copy
+                        # reduce float verbosity and format gsv for readability
+                        for k in list(out.keys()):
+                            v = out[k]
                             if k == 'gsv':
-                                # Convert GSV dict to string representation
-                                format_dict[k] = str(v)
+                                # Flatten gsv to just {"GP": 7, "GL": 8} format
+                                out[k] = {sys: data.get('in_view', 0) for sys, data in v.items()}
                             elif isinstance(v, float):
-                                format_dict[k] = v
-                            else:
-                                format_dict[k] = v
-                        # Use % formatting with the state dict
-                        print(args.format % format_dict)
-                    except (KeyError, ValueError, TypeError) as e:
-                        print(f"Format error: {e}", file=sys.stderr)
-                elif args.json:
-                    out = dict(state)  # shallow copy
-                    # reduce float verbosity
-                    for k in list(out.keys()):
-                        v = out[k]
-                        if isinstance(v, float):
-                            out[k] = round(v, 6 if k in ('lat','lon') else 3)
-                    print(json.dumps(out, separators=(',',':'), ensure_ascii=False))
-                else:
-                    line = human_status(state)
-                    print(line, end='\r', flush=True)
-                if args.once and state.get('lat') is not None and state.get('lon') is not None and state.get('utc_time'):
-                    print()  # newline after carriage return
-                    break
+                                out[k] = round(v, 6 if k in ('lat','lon') else 3)
+                        print(json.dumps(out, separators=(',',':'), ensure_ascii=False), flush=True)
+                    else:
+                        line = human_status(state)
+                        print(line, flush=True)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
